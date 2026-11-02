@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ABS Bible School: Lessons</title>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0e1a2b;--card:#16263d;--ink:#f4efe4;--muted:#a9b6c8;--gold:#f2b84b;--line:#2b4162}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"Bricolage Grotesque",system-ui,sans-serif;line-height:1.55;padding:24px 20px calc(40px + env(safe-area-inset-bottom,0px))}
+.w{max-width:560px;margin:0 auto}
+h1{font-size:30px;line-height:1.15;font-weight:800;margin:20px 0 10px}
+p{color:var(--muted);font-size:17px;margin:0 0 14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:22px;margin-bottom:16px}
+label{display:block;font-weight:600;margin:14px 0 6px;font-size:15px}
+input{width:100%;padding:14px;border-radius:12px;border:1px solid var(--line);background:var(--bg);color:var(--ink);font:inherit;font-size:16px}
+input:focus,button:focus-visible{outline:3px solid var(--gold);outline-offset:2px}
+.btn{display:block;width:100%;margin-top:20px;padding:16px;border:0;border-radius:99px;background:var(--gold);color:#14233a;font:800 17px inherit;cursor:pointer}
+.btn:disabled{opacity:.6}
+.err{color:#ff8a7a;font-size:14px;min-height:18px;margin-top:10px}
+.tag{display:inline-block;background:var(--gold);color:#14233a;font-weight:800;font-size:13px;border-radius:99px;padding:3px 12px;margin-bottom:8px}
+.yt{aspect-ratio:16/9;border-radius:16px;overflow:hidden;background:#000;margin:14px 0}
+.yt iframe{width:100%;height:100%;border:0}
+.hid{display:none}
+.out{background:none;border:0;color:var(--muted);text-decoration:underline;font:inherit;display:block;margin:18px auto 0;cursor:pointer}
+</style>
+</head>
+<body>
+<div class="w">
+  <h1>ABS lessons</h1>
+
+  <form class="card" id="login" novalidate>
+    <p style="margin-top:0">Sign in with your registered email and your batch code.</p>
+    <label for="email">Email</label><input id="email" type="email" autocomplete="email">
+    <label for="code">Batch code</label><input id="code" autocomplete="off">
+    <div class="err" id="err" role="alert"></div>
+    <button class="btn" id="go" type="submit">Open my lesson</button>
+  </form>
+
+  <div id="view" class="hid">
+    <div class="card">
+      <span class="tag" id="tag"></span>
+      <h2 id="title" style="margin:4px 0 0;font-size:24px"></h2>
+      <div class="yt" id="ytbox"></div>
+      <p id="left" style="margin:0"></p>
+      <p id="notes" style="margin:10px 0 0"></p>
+    </div>
+    <div class="card hid" id="msg"><p id="msgtxt" style="margin:0"></p></div>
+    <button class="out" id="out" type="button">Sign out</button>
+  </div>
+</div>
+
+<script>
+var SCRIPT_URL='PASTE_YOUR_APPS_SCRIPT_WEB_APP_URL_HERE';
+var $=function(i){return document.getElementById(i)};
+
+function fmt(iso){return new Date(iso).toLocaleDateString(undefined,{weekday:'long',day:'numeric',month:'long',year:'numeric'})}
+
+function render(r){
+  $('login').classList.add('hid');$('view').classList.remove('hid');
+  var open=r.state==='open';
+  $('tag').style.display=open?'inline-block':'none';
+  $('title').style.display=open?'block':'none';
+  $('ytbox').style.display=open?'block':'none';
+  $('left').style.display=open?'block':'none';
+  $('notes').style.display=open?'block':'none';
+  document.querySelector('#view .card').style.display=open?'block':'none';
+  $('msg').classList.toggle('hid',open);
+  if(open){
+    $('tag').textContent='Lesson '+r.lesson+' of '+r.total;
+    $('title').textContent=r.title;
+    $('ytbox').innerHTML='<iframe src="https://www.youtube.com/embed/'+encodeURIComponent(r.videoId)+'?rel=0&playsinline=1" allow="accelerometer; encrypted-media; picture-in-picture; fullscreen" allowfullscreen title="Lesson video"></iframe>';
+    var days=Math.max(1,Math.ceil((new Date(r.closes)-new Date())/864e5));
+    $('left').textContent='This lesson is open for '+days+' more day'+(days>1?'s':'')+'. It closes on '+fmt(r.closes)+'.';
+    $('notes').textContent=r.notes||'';
+  }else if(r.state==='notstarted'){
+    $('msgtxt').textContent='Your batch begins on '+fmt(r.opens)+'. Come back then to start Lesson 1.';
+  }else{
+    $('msgtxt').textContent='You have completed all lessons for this batch. Thank you for studying with us.';
+  }
+}
+
+function load(email,code,silent){
+  var b=$('go');b.disabled=true;b.textContent='Checking…';
+  var url=SCRIPT_URL+'?action=lesson&email='+encodeURIComponent(email)+'&code='+encodeURIComponent(code);
+  return fetch(url).then(function(x){return x.json()}).then(function(r){
+    b.disabled=false;b.textContent='Open my lesson';
+    if(!r.ok){if(!silent)$('err').textContent=r.error||'Could not sign in.';return}
+    try{sessionStorage.setItem('abs',JSON.stringify({e:email,c:code}))}catch(e){}
+    render(r);
+  }).catch(function(){b.disabled=false;b.textContent='Open my lesson';if(!silent)$('err').textContent='Connection problem. Please try again.'});
+}
+
+$('login').addEventListener('submit',function(e){
+  e.preventDefault();
+  var em=$('email').value.trim(),c=$('code').value.trim();
+  if(!em||!c){$('err').textContent='Enter your email and batch code.';return}
+  $('err').textContent='';load(em,c,false);
+});
+$('out').addEventListener('click',function(){
+  try{sessionStorage.removeItem('abs')}catch(e){}
+  $('ytbox').innerHTML='';$('view').classList.add('hid');$('login').classList.remove('hid');
+});
+try{var s=JSON.parse(sessionStorage.getItem('abs')||'null');if(s)load(s.e,s.c,true)}catch(e){}
+</script>
+</body>
+</html>

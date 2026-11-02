@@ -1,0 +1,192 @@
+/**
+ * ABS Bible School: complete Apps Script backend
+ * Bound to the Google Sheet that acts as your database.
+ *
+ * Tabs used:
+ *   Applications  (created automatically)  Timestamp | ID | Status | form fields...
+ *   Students      Email | Batch
+ *   Batches       Batch | Code | StartDate
+ *   Lessons       Lesson | Title | VideoID | Notes
+ *
+ * Run setupSheets() once to create the tabs with their headers.
+ */
+
+// ---------- SETTINGS: change these ----------
+var SCRIPT_URL = 'PASTE_YOUR_WEB_APP_/exec_URL_HERE'; // from Deploy > Manage deployments
+var LESSONS_URL = 'https://yourdomain.com/lessons.html'; // where lessons.html is hosted
+var ADMIN_EMAIL = 'admissions@yourdomain.com';           // receives "needs a batch" alerts
+var SCHOOL_NAME = 'ABS Bible School';
+var WEEK_MS = 7 * 24 * 60 * 60 * 1000;                   // each lesson stays open 7 days
+// --------------------------------------------
+
+function setupSheets() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var tabs = {
+    'Students': ['Email', 'Batch'],
+    'Batches': ['Batch', 'Code', 'StartDate'],
+    'Lessons': ['Lesson', 'Title', 'VideoID', 'Notes']
+  };
+  Object.keys(tabs).forEach(function (name) {
+    var sh = ss.getSheetByName(name) || ss.insertSheet(name);
+    if (sh.getLastRow() === 0) sh.appendRow(tabs[name]);
+  });
+}
+
+function jsonOut(o) {
+  return ContentService.createTextOutput(JSON.stringify(o))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ---------- 1. Application form (index.html) ----------
+function doPost(e) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    var d = JSON.parse(e.postData.contents);
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sh = ss.getSheetByName('Applications') || ss.insertSheet('Applications');
+    var keys = Object.keys(d), id = Utilities.getUuid();
+
+    if (sh.getLastRow() === 0) sh.appendRow(['Timestamp', 'ID', 'Status'].concat(keys));
+    sh.appendRow([new Date(), id, 'Pending'].concat(keys.map(function (k) { return d[k]; })));
+
+    MailApp.sendEmail(d.email, 'Action required: confirm your ' + SCHOOL_NAME + ' registration',
+      'Hello ' + d.name + ',\n\nThank you for applying. Please confirm your registration by opening this link:\n' +
+      SCRIPT_URL + '?confirm=' + id + '\n\nOnce confirmed, you will receive your welcome email.');
+    return ContentService.createTextOutput('ok');
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ---------- 2. Email confirmation link + lesson lookup ----------
+function doGet(e) {
+  var p = e.parameter || {};
+  if (p.action === 'lesson') return lessonApi(p);
+  if (p.confirm) return confirmApplication(p.confirm);
+  return HtmlService.createHtmlOutput('ABS service is running.');
+}
+
+function confirmApplication(id) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName('Applications');
+  var hit = sh ? sh.createTextFinder(id).matchEntireCell(true).findNext() : null;
+  if (!hit) return HtmlService.createHtmlOutput('Link not valid.');
+
+  var row = hit.getRow();
+  if (sh.getRange(row, 3).getValue() !== 'Confirmed') {
+    var head = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+    var email = String(sh.getRange(row, head.indexOf('email') + 1).getValue()).trim();
+    var name = sh.getRange(row, head.indexOf('name') + 1).getValue();
+    sh.getRange(row, 3).setValue('Confirmed');
+
+    var b = addStudent(ss, email);
+    var body = 'Dear ' + name + ',\n\nWelcome to ' + SCHOOL_NAME + '! Your registration is confirmed.';
+    if (b) {
+      body += '\n\nYour batch: ' + b.batch +
+        '\nStarts: ' + Utilities.formatDate(b.start, Session.getScriptTimeZone(), 'EEEE d MMMM yyyy') +
+        '\nBatch code: ' + b.code +
+        '\nLessons page: ' + LESSONS_URL +
+        '\n\nSign in with this email address and your batch code. A new lesson opens each week.';
+    } else {
+      body += '\n\nWe will email your batch details as soon as the next batch is scheduled.';
+      notifyUnassigned(name, email);
+    }
+    MailApp.sendEmail(email, 'Welcome to ' + SCHOOL_NAME, body);
+  }
+  return HtmlService.createHtmlOutput(
+    'Thank you. Your registration is confirmed. Check your email for your batch details. You can close this page.');
+}
+
+// ---------- 3. Batches and students ----------
+function startOfDay(v) {
+  var d = new Date(v);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function batchByName(ss, name) {
+  var rows = ss.getSheetByName('Batches').getDataRange().getValues().slice(1);
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i][0] && String(rows[i][0]).trim() === String(name).trim() && rows[i][2]) {
+      return {batch: String(rows[i][0]).trim(), code: String(rows[i][1]).trim(), start: startOfDay(rows[i][2])};
+    }
+  }
+  return null;
+}
+
+// Earliest batch that has not started yet
+function nextBatch(ss) {
+  var today = startOfDay(new Date()), best = null;
+  ss.getSheetByName('Batches').getDataRange().getValues().slice(1).forEach(function (r) {
+    if (!r[0] || !r[2]) return;
+    var s = startOfDay(r[2]);
+    if (s >= today && (!best || s < best.start)) {
+      best = {batch: String(r[0]).trim(), code: String(r[1]).trim(), start: s};
+    }
+  });
+  return best;
+}
+
+// Adds the student once and returns their batch details, or null if unassigned
+function addStudent(ss, email) {
+  var st = ss.getSheetByName('Students') || ss.insertSheet('Students');
+  if (st.getLastRow() === 0) st.appendRow(['Email', 'Batch']);
+  var key = email.toLowerCase(), data = st.getDataRange().getValues();
+
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim().toLowerCase() === key) {
+      return data[i][1] && data[i][1] !== 'Unassigned' ? batchByName(ss, data[i][1]) : null;
+    }
+  }
+  var b = nextBatch(ss);
+  st.appendRow([email, b ? b.batch : 'Unassigned']);
+  return b;
+}
+
+function notifyUnassigned(name, email) {
+  MailApp.sendEmail(ADMIN_EMAIL, 'ABS: student needs a batch',
+    name + ' (' + email + ') confirmed their registration, but no upcoming batch exists.\n\n' +
+    'Next steps:\n' +
+    '1. Add a new batch in the "Batches" tab (Batch, Code, StartDate).\n' +
+    '2. In the "Students" tab, type that batch name next to their email.\n' +
+    '3. Email them their batch code and start date.');
+}
+
+// ---------- 4. Lesson lookup (lessons.html) ----------
+function lessonApi(p) {
+  var email = String(p.email || '').trim().toLowerCase();
+  var code = String(p.code || '').trim();
+  var fail = {ok: false, error: 'We could not match that email and batch code.'};
+  if (!email || !code) return jsonOut(fail);
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // Which batch is this student in?
+  var batchName = null;
+  var students = ss.getSheetByName('Students').getDataRange().getValues();
+  for (var i = 1; i < students.length; i++) {
+    if (String(students[i][0]).trim().toLowerCase() === email) batchName = String(students[i][1]).trim();
+  }
+  if (!batchName || batchName === 'Unassigned') return jsonOut(fail);
+
+  // Does the code match that batch?
+  var b = batchByName(ss, batchName);
+  if (!b || b.code !== code) return jsonOut(fail);
+
+  var now = new Date();
+  if (now < b.start) return jsonOut({ok: true, state: 'notstarted', opens: b.start.toISOString()});
+
+  // Which week are we in?
+  var lessons = ss.getSheetByName('Lessons').getDataRange().getValues().slice(1)
+    .filter(function (r) { return r[0] !== ''; });
+  var n = Math.floor((now - b.start) / WEEK_MS) + 1;
+  var row = lessons.filter(function (r) { return Number(r[0]) === n; })[0];
+  if (n > lessons.length || !row) return jsonOut({ok: true, state: 'finished'});
+
+  return jsonOut({
+    ok: true, state: 'open', lesson: n, total: lessons.length,
+    title: row[1], videoId: String(row[2]).trim(), notes: row[3],
+    closes: new Date(b.start.getTime() + n * WEEK_MS).toISOString()
+  });
+}
