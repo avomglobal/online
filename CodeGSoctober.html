@@ -1,0 +1,455 @@
+/**
+ * ABS Bible School: complete Apps Script backend
+ * Bound to the Google Sheet that acts as your database.
+ *
+ * Tabs: Applications (auto), Students, Batches, Lessons, Courses, Records, ChangeLog
+ * Run setupSheets() once to create the tabs with their headers.
+ */
+
+// ---------- SETTINGS: change these ----------
+var SCRIPT_URL = 'PASTE_YOUR_WEB_APP_/exec_URL_HERE';   // Deploy > Manage deployments
+var LESSONS_URL = 'https://yourdomain.com/lessons.html';
+var ADMIN_EMAIL = 'admissions@yourdomain.com';
+var SCHOOL_NAME = 'ABS Bible School';
+var LOGO_URL = '';            // full public address of your logo, e.g. https://yourdomain.com/logo.png (optional)
+var WEEK_MS = 7 * 24 * 60 * 60 * 1000;   // each lesson stays open 7 days
+var PASS_MARK = 60;
+var GRADE_BANDS = [[90, 'A'], [80, 'B'], [70, 'C'], [60, 'D'], [0, 'F']]; // minimum score, letter
+// --------------------------------------------
+
+function setupSheets() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var tabs = {
+    'Students': ['Email', 'Batch'],
+    'Batches': ['Batch', 'Code', 'StartDate'],
+    'Lessons': ['Lesson', 'Title', 'VideoID', 'Notes'],
+    'Courses': ['Code', 'Title', 'Level'],
+    'Records': ['Email', 'Course', 'Score', 'Attendance', 'Term', 'Date', 'EnteredBy'],
+    'ChangeLog': ['Time', 'Staff', 'Action', 'Email', 'Course', 'Old', 'New']
+  };
+  Object.keys(tabs).forEach(function (name) {
+    var sh = ss.getSheetByName(name) || ss.insertSheet(name);
+    if (sh.getLastRow() === 0) sh.appendRow(tabs[name]);
+  });
+}
+
+function jsonOut(o) {
+  return ContentService.createTextOutput(JSON.stringify(o))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function startOfDay(v) {
+  var d = new Date(v);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+// ---------- 1. Application form and staff requests (POST) ----------
+function doPost(e) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    var d = JSON.parse(e.postData.contents);
+    if (d.action) return adminApi(d);
+
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sh = ss.getSheetByName('Applications') || ss.insertSheet('Applications');
+    var keys = Object.keys(d), id = Utilities.getUuid();
+    if (sh.getLastRow() === 0) sh.appendRow(['Timestamp', 'ID', 'Status'].concat(keys));
+    sh.appendRow([new Date(), id, 'Pending'].concat(keys.map(function (k) { return d[k]; })));
+
+    MailApp.sendEmail(d.email, 'Action required: confirm your ' + SCHOOL_NAME + ' registration',
+      'Hello ' + d.name + ',\n\nThank you for applying. Please confirm your registration by opening this link:\n' +
+      SCRIPT_URL + '?confirm=' + id + '\n\nOnce confirmed, you will receive your welcome email.');
+    return ContentService.createTextOutput('ok');
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ---------- 2. Links and student requests (GET) ----------
+function doGet(e) {
+  var p = e.parameter || {};
+  if (p.action === 'lesson') return lessonApi(p);
+  if (p.action === 'grades') return gradesApi(p);
+  if (p.action === 'transcript') return transcriptApi(p);
+  if (p.confirm) return confirmApplication(p.confirm);
+  return HtmlService.createHtmlOutput('ABS service is running.');
+}
+
+function confirmApplication(id) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName('Applications');
+  var hit = sh ? sh.createTextFinder(id).matchEntireCell(true).findNext() : null;
+  if (!hit) return HtmlService.createHtmlOutput('Link not valid.');
+
+  var row = hit.getRow();
+  if (sh.getRange(row, 3).getValue() !== 'Confirmed') {
+    var head = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+    var email = String(sh.getRange(row, head.indexOf('email') + 1).getValue()).trim();
+    var name = sh.getRange(row, head.indexOf('name') + 1).getValue();
+    sh.getRange(row, 3).setValue('Confirmed');
+
+    var b = addStudent(ss, email);
+    var body = 'Dear ' + name + ',\n\nWelcome to ' + SCHOOL_NAME + '! Your registration is confirmed.';
+    if (b) {
+      body += '\n\nYour batch: ' + b.batch +
+        '\nStarts: ' + Utilities.formatDate(b.start, Session.getScriptTimeZone(), 'EEEE d MMMM yyyy') +
+        '\nBatch code: ' + b.code +
+        '\nLessons page: ' + LESSONS_URL +
+        '\n\nSign in with this email address and your batch code. A new lesson opens each week.';
+    } else {
+      body += '\n\nWe will email your batch details as soon as the next batch is scheduled.';
+      notifyUnassigned(name, email);
+    }
+    MailApp.sendEmail(email, 'Welcome to ' + SCHOOL_NAME, body);
+  }
+  return HtmlService.createHtmlOutput(
+    'Thank you. Your registration is confirmed. Check your email for your batch details. You can close this page.');
+}
+
+// ---------- 3. Batches and students ----------
+function batchByName(ss, name) {
+  var rows = ss.getSheetByName('Batches').getDataRange().getValues().slice(1);
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i][0] && String(rows[i][0]).trim() === String(name).trim() && rows[i][2]) {
+      return {batch: String(rows[i][0]).trim(), code: String(rows[i][1]).trim(), start: startOfDay(rows[i][2])};
+    }
+  }
+  return null;
+}
+
+function nextBatch(ss) {
+  var today = startOfDay(new Date()), best = null;
+  ss.getSheetByName('Batches').getDataRange().getValues().slice(1).forEach(function (r) {
+    if (!r[0] || !r[2]) return;
+    var s = startOfDay(r[2]);
+    if (s >= today && (!best || s < best.start)) {
+      best = {batch: String(r[0]).trim(), code: String(r[1]).trim(), start: s};
+    }
+  });
+  return best;
+}
+
+function addStudent(ss, email) {
+  var st = ss.getSheetByName('Students') || ss.insertSheet('Students');
+  if (st.getLastRow() === 0) st.appendRow(['Email', 'Batch']);
+  var key = email.toLowerCase(), data = st.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim().toLowerCase() === key) {
+      return data[i][1] && data[i][1] !== 'Unassigned' ? batchByName(ss, data[i][1]) : null;
+    }
+  }
+  var b = nextBatch(ss);
+  st.appendRow([email, b ? b.batch : 'Unassigned']);
+  return b;
+}
+
+function notifyUnassigned(name, email) {
+  MailApp.sendEmail(ADMIN_EMAIL, 'ABS: student needs a batch',
+    name + ' (' + email + ') confirmed their registration, but no upcoming batch exists.\n\n' +
+    'Next steps:\n' +
+    '1. Add a new batch in the "Batches" tab (Batch, Code, StartDate).\n' +
+    '2. In the "Students" tab, type that batch name next to their email.\n' +
+    '3. Email them their batch code and start date.');
+}
+
+// Checks email + batch code. Returns the batch, or null if they do not match.
+function verifyStudent(ss, email, code) {
+  var batchName = null;
+  ss.getSheetByName('Students').getDataRange().getValues().slice(1).forEach(function (r) {
+    if (String(r[0]).trim().toLowerCase() === email) batchName = String(r[1]).trim();
+  });
+  if (!batchName || batchName === 'Unassigned') return null;
+  var b = batchByName(ss, batchName);
+  return b && b.code === code ? b : null;
+}
+
+var NO_MATCH = {ok: false, error: 'We could not match that email and batch code.'};
+
+// ---------- 4. Lessons (lessons.html) ----------
+function lessonApi(p) {
+  var email = String(p.email || '').trim().toLowerCase(), code = String(p.code || '').trim();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var b = email && code ? verifyStudent(ss, email, code) : null;
+  if (!b) return jsonOut(NO_MATCH);
+
+  var now = new Date();
+  if (now < b.start) return jsonOut({ok: true, state: 'notstarted', opens: b.start.toISOString()});
+
+  var lessons = ss.getSheetByName('Lessons').getDataRange().getValues().slice(1)
+    .filter(function (r) { return r[0] !== ''; });
+  var n = Math.floor((now - b.start) / WEEK_MS) + 1;
+  var row = lessons.filter(function (r) { return Number(r[0]) === n; })[0];
+  if (n > lessons.length || !row) return jsonOut({ok: true, state: 'finished'});
+
+  return jsonOut({
+    ok: true, state: 'open', lesson: n, total: lessons.length,
+    title: row[1], videoId: String(row[2]).trim(), notes: row[3],
+    closes: new Date(b.start.getTime() + n * WEEK_MS).toISOString()
+  });
+}
+
+// ---------- 5. Sheet menu: assign and email unassigned students ----------
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('ABS')
+    .addItem('Assign and email unassigned students', 'emailUnassigned')
+    .addToUi();
+}
+
+function emailUnassigned() {
+  var ui = SpreadsheetApp.getUi(), ss = SpreadsheetApp.getActiveSpreadsheet();
+  var b = nextBatch(ss);
+  if (!b) {
+    ui.alert('No upcoming batch found. Add a row in the Batches tab with a future start date, then try again.');
+    return;
+  }
+  var names = {}, app = ss.getSheetByName('Applications');
+  if (app && app.getLastRow() > 1) {
+    var vals = app.getDataRange().getValues(), ei = vals[0].indexOf('email'), ni = vals[0].indexOf('name');
+    for (var r = 1; r < vals.length; r++) names[String(vals[r][ei]).trim().toLowerCase()] = vals[r][ni];
+  }
+  var st = ss.getSheetByName('Students'), data = st.getDataRange().getValues(), count = 0;
+  var startText = Utilities.formatDate(b.start, Session.getScriptTimeZone(), 'EEEE d MMMM yyyy');
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][1]).trim() !== 'Unassigned') continue;
+    var email = String(data[i][0]).trim();
+    st.getRange(i + 1, 2).setValue(b.batch);
+    MailApp.sendEmail(email, 'Your ' + SCHOOL_NAME + ' batch details',
+      'Dear ' + (names[email.toLowerCase()] || 'student') + ',\n\nYour batch is ready.' +
+      '\n\nYour batch: ' + b.batch + '\nStarts: ' + startText + '\nBatch code: ' + b.code +
+      '\nLessons page: ' + LESSONS_URL +
+      '\n\nSign in with this email address and your batch code. A new lesson opens each week.');
+    count++;
+  }
+  ui.alert(count + ' student(s) assigned to ' + b.batch + ' and emailed.');
+}
+
+// ---------- 6. Staff admin (admin.html) ----------
+// STAFF_KEYS (Script properties) looks like: Grace:longkey1,David:longkey2
+function staffName(key) {
+  var list = (PropertiesService.getScriptProperties().getProperty('STAFF_KEYS') || '').split(',');
+  for (var i = 0; i < list.length; i++) {
+    var p = list[i].trim().split(':');
+    var name = p.length > 1 ? p[0].trim() : 'Staff';
+    var k = (p.length > 1 ? p.slice(1).join(':') : p[0]).trim();
+    if (k && k === String(key)) return name;
+  }
+  return null;
+}
+
+function logChange(ss, who, action, email, course, oldV, newV) {
+  var sh = ss.getSheetByName('ChangeLog') || ss.insertSheet('ChangeLog');
+  sh.appendRow([new Date(), who, action, email, course, oldV, newV]);
+}
+
+function adminApi(d) {
+  var cache = CacheService.getScriptCache(), fails = Number(cache.get('fails') || 0);
+  if (fails >= 5) return jsonOut({ok: false, error: 'Too many wrong attempts. Try again in 10 minutes.'});
+  var who = d.key ? staffName(d.key) : null;
+  if (!who) {
+    cache.put('fails', fails + 1, 600);
+    return jsonOut({ok: false, error: 'Wrong staff key.'});
+  }
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet(), tz = Session.getScriptTimeZone();
+  var app = ss.getSheetByName('Applications'), st = ss.getSheetByName('Students');
+  var wanted = String(d.email || '').trim().toLowerCase();
+
+  if (d.action === 'list') {
+    var out = {ok: true, apps: [], students: [], batches: []};
+    if (app && app.getLastRow() > 1) {
+      var v = app.getDataRange().getValues(), h = v[0];
+      for (var i = 1; i < v.length; i++) {
+        out.apps.push({
+          when: Utilities.formatDate(new Date(v[i][0]), tz, 'yyyy-MM-dd'), status: v[i][2],
+          name: v[i][h.indexOf('name')], email: v[i][h.indexOf('email')],
+          phone: v[i][h.indexOf('phone')], program: v[i][h.indexOf('program')]
+        });
+      }
+    }
+    st.getDataRange().getValues().slice(1).forEach(function (r) {
+      if (r[0]) out.students.push({email: r[0], batch: r[1]});
+    });
+    ss.getSheetByName('Batches').getDataRange().getValues().slice(1).forEach(function (r) {
+      if (r[0]) out.batches.push({batch: r[0], code: r[1],
+        start: r[2] ? Utilities.formatDate(new Date(r[2]), tz, 'yyyy-MM-dd') : ''});
+    });
+    return jsonOut(out);
+  }
+
+  if (d.action === 'resend') {
+    var v2 = app.getDataRange().getValues(), ei = v2[0].indexOf('email');
+    for (var j = v2.length - 1; j >= 1; j--) {
+      if (String(v2[j][ei]).trim().toLowerCase() === wanted && v2[j][2] === 'Pending') {
+        MailApp.sendEmail(String(v2[j][ei]).trim(), 'Action required: confirm your ' + SCHOOL_NAME + ' registration',
+          'Please confirm your registration by opening this link:\n' + SCRIPT_URL + '?confirm=' + v2[j][1]);
+        return jsonOut({ok: true});
+      }
+    }
+    return jsonOut({ok: false, error: 'No pending application found for that email.'});
+  }
+
+  if (d.action === 'setBatch') {
+    var s = st.getDataRange().getValues();
+    for (var k = 1; k < s.length; k++) {
+      if (String(s[k][0]).trim().toLowerCase() === wanted) {
+        logChange(ss, who, 'setBatch', wanted, '', s[k][1], d.batch);
+        st.getRange(k + 1, 2).setValue(d.batch);
+        return jsonOut({ok: true});
+      }
+    }
+    return jsonOut({ok: false, error: 'Student not found.'});
+  }
+
+  if (d.action === 'addBatch') {
+    var p = String(d.start).split('-');
+    ss.getSheetByName('Batches').appendRow([d.batch, d.code, new Date(p[0], p[1] - 1, p[2])]);
+    logChange(ss, who, 'addBatch', '', d.batch, '', d.start);
+    return jsonOut({ok: true});
+  }
+
+  if (d.action === 'addLesson') {
+    ss.getSheetByName('Lessons').appendRow([Number(d.lesson), d.title, d.videoId, d.notes || '']);
+    logChange(ss, who, 'addLesson', '', d.lesson, '', d.title);
+    return jsonOut({ok: true});
+  }
+
+  var rec = adminRecords(d, ss, who);
+  if (rec) return rec;
+  return jsonOut({ok: false, error: 'Unknown action.'});
+}
+
+// ---------- 7. Academic records ----------
+function gradeOf(score) {
+  for (var i = 0; i < GRADE_BANDS.length; i++) if (score >= GRADE_BANDS[i][0]) return GRADE_BANDS[i][1];
+  return 'F';
+}
+
+function recordsFor(ss, email) {
+  var titles = {};
+  ss.getSheetByName('Courses').getDataRange().getValues().slice(1)
+    .forEach(function (r) { titles[String(r[0])] = r[1]; });
+  var list = [], sum = 0, att = 0, passed = 0;
+  ss.getSheetByName('Records').getDataRange().getValues().slice(1).forEach(function (r) {
+    if (String(r[0]).trim().toLowerCase() !== email) return;
+    var score = Number(r[2]), pass = score >= PASS_MARK;
+    list.push({course: r[1], title: titles[String(r[1])] || r[1], score: score, grade: gradeOf(score),
+      pass: pass, attendance: Number(r[3]), term: r[4]});
+    sum += score; att += Number(r[3]); if (pass) passed++;
+  });
+  var n = list.length;
+  return {records: list, summary: {courses: n, passed: passed,
+    average: n ? Math.round(sum / n * 10) / 10 : 0, attendance: n ? Math.round(att / n) : 0}};
+}
+
+function adminRecords(d, ss, who) {
+  var email = String(d.email || '').trim().toLowerCase();
+
+  if (d.action === 'records') {
+    var out = recordsFor(ss, email); out.ok = true;
+    out.courses = ss.getSheetByName('Courses').getDataRange().getValues().slice(1)
+      .filter(function (r) { return r[0]; })
+      .map(function (r) { return {code: r[0], title: r[1], level: r[2]}; });
+    return jsonOut(out);
+  }
+
+  if (d.action === 'addCourse') {
+    ss.getSheetByName('Courses').appendRow([d.code, d.title, d.level]);
+    logChange(ss, who, 'addCourse', '', d.code, '', d.title);
+    return jsonOut({ok: true});
+  }
+
+  if (d.action === 'saveRecord') {
+    var score = Number(d.score), att = Number(d.attendance);
+    if (isNaN(score) || score < 0 || score > 100 || isNaN(att) || att < 0 || att > 100)
+      return jsonOut({ok: false, error: 'Score and attendance must be between 0 and 100.'});
+    var sh = ss.getSheetByName('Records'), v = sh.getDataRange().getValues();
+    for (var i = 1; i < v.length; i++) {
+      if (String(v[i][0]).trim().toLowerCase() === email && String(v[i][1]) === String(d.course)
+          && String(v[i][4]) === String(d.term)) {
+        sh.getRange(i + 1, 3, 1, 5).setValues([[score, att, d.term, new Date(), who]]);
+        logChange(ss, who, 'edit', email, d.course, v[i][2] + ' / ' + v[i][3], score + ' / ' + att);
+        return jsonOut({ok: true});
+      }
+    }
+    sh.appendRow([email, d.course, score, att, d.term, new Date(), who]);
+    logChange(ss, who, 'add', email, d.course, '', score + ' / ' + att);
+    return jsonOut({ok: true});
+  }
+
+  if (d.action === 'transcript') {
+    var t = transcriptFor(ss, email);
+    t.ok = true;
+    return jsonOut(t);
+  }
+  return null;
+}
+
+// Student view of their own results
+function gradesApi(p) {
+  var email = String(p.email || '').trim().toLowerCase(), code = String(p.code || '').trim();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!email || !code || !verifyStudent(ss, email, code)) return jsonOut(NO_MATCH);
+  var out = recordsFor(ss, email); out.ok = true; out.passMark = PASS_MARK;
+  return jsonOut(out);
+}
+
+// ---------- 8. PDF transcript ----------
+function esc(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function studentName(ss, email) {
+  var app = ss.getSheetByName('Applications');
+  if (!app || app.getLastRow() < 2) return email;
+  var v = app.getDataRange().getValues(), ei = v[0].indexOf('email'), ni = v[0].indexOf('name');
+  for (var i = v.length - 1; i >= 1; i--) {
+    if (String(v[i][ei]).trim().toLowerCase() === email) return v[i][ni] || email;
+  }
+  return email;
+}
+
+function transcriptFor(ss, email) {
+  var rec = recordsFor(ss, email), name = studentName(ss, email), batch = '';
+  ss.getSheetByName('Students').getDataRange().getValues().slice(1).forEach(function (r) {
+    if (String(r[0]).trim().toLowerCase() === email) batch = r[1];
+  });
+  var cell = 'border:1px solid #999;padding:6px;';
+  var rows = rec.records.map(function (x) {
+    return '<tr><td style="' + cell + '">' + esc(x.title) + '</td><td style="' + cell + '">' + esc(x.term) +
+      '</td><td style="' + cell + '">' + x.score + '</td><td style="' + cell + '">' + x.grade +
+      '</td><td style="' + cell + '">' + (x.pass ? 'Pass' : 'Fail') + '</td><td style="' + cell + '">' +
+      x.attendance + '%</td></tr>';
+  }).join('');
+  var m = rec.summary;
+  var html = '<html><body style="font-family:Arial,sans-serif;color:#14233a;padding:24px">' +
+    (LOGO_URL ? '<div style="text-align:center"><img src="' + esc(LOGO_URL) + '" style="max-height:70px"></div>' : '') +
+    '<h1 style="text-align:center;margin:8px 0 0">' + esc(SCHOOL_NAME) + '</h1>' +
+    '<h2 style="text-align:center;margin:4px 0 20px;font-weight:normal">Academic transcript</h2>' +
+    '<p><b>Student:</b> ' + esc(name) + '<br><b>Email:</b> ' + esc(email) +
+    '<br><b>Batch:</b> ' + esc(batch) + '</p>' +
+    '<table style="border-collapse:collapse;width:100%;font-size:13px"><tr style="background:#eee">' +
+    '<th style="' + cell + '">Course</th><th style="' + cell + '">Term</th><th style="' + cell + '">Score</th>' +
+    '<th style="' + cell + '">Grade</th><th style="' + cell + '">Result</th><th style="' + cell + '">Attendance</th></tr>' +
+    rows + '</table>' +
+    '<p style="margin-top:16px"><b>Average:</b> ' + m.average + ' &nbsp; <b>Courses passed:</b> ' + m.passed +
+    ' of ' + m.courses + ' &nbsp; <b>Attendance:</b> ' + m.attendance + '%</p>' +
+    '<p style="font-size:12px;color:#555">Scores are out of 100. Pass mark: ' + PASS_MARK + '.</p>' +
+    '<p style="font-size:12px;color:#555">Issued on ' +
+    Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'd MMMM yyyy') + '.</p></body></html>';
+  var pdf = Utilities.newBlob(html, 'text/html', 'transcript.html').getAs('application/pdf');
+  var safe = String(name).replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'student';
+  return {filename: 'ABS-transcript-' + safe + '.pdf', data: Utilities.base64Encode(pdf.getBytes())};
+}
+
+// Student downloads their own transcript
+function transcriptApi(p) {
+  var email = String(p.email || '').trim().toLowerCase(), code = String(p.code || '').trim();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!email || !code || !verifyStudent(ss, email, code)) return jsonOut(NO_MATCH);
+  var t = transcriptFor(ss, email);
+  t.ok = true;
+  return jsonOut(t);
+}
