@@ -151,7 +151,7 @@ There is Victory College International in Tulsa (U.S.A.), in St. Petersburg (Rus
 </dialog>
 
 <script>
-var SCRIPT_URL='PASTE_YOUR_APPS_SCRIPT_WEB_APP_URL_HERE';
+var SCRIPT_URL='https://script.google.com/macros/s/AKfycbwheq9zxFXrOJgTB7784xg_8xtMg3oYkGoRyFxePOiuIatBv6_XA8JfB6_ghkNB5amKfQ/exec';
 var dlg=document.getElementById('dlg'),fl=document.getElementById('float');
 
 document.querySelectorAll('[data-apply]').forEach(function(b){b.addEventListener('click',function(){fl.classList.remove('show');dlg.showModal()})});
@@ -193,7 +193,7 @@ document.getElementById('form').addEventListener('submit',function(e){
 function setProg(p){var f=document.getElementById('fill');f.style.width=p+'%';f.textContent=p+'%';document.getElementById('bar').setAttribute('aria-valuenow',p)}
 function show(id){document.querySelectorAll('.pane').forEach(function(x){x.classList.remove('on')});document.getElementById(id).classList.add('on');dlg.scrollTop=0}
 // YouTube videos: put your two video IDs here (the part after v= in the link)
-var VIDEO_IDS={v1:'YOUR_VIDEO_1_ID',v2:'YOUR_VIDEO_2_ID'};
+var VIDEO_IDS={v1:'rGlMUk-qPiU',v2:'y5G1zh8QYtY'};
 var players={},reveals={};
 var tag=document.createElement('script');tag.src='https://www.youtube.com/iframe_api';document.head.appendChild(tag);
 function onYouTubeIframeAPIReady(){
